@@ -109,8 +109,18 @@ def run_eda(data_path: Path) -> None:
 
     print("\n--- 6. Chronological Split (Time Drift Simulation) ---")
     training_window, later_window = chronological_split(df)
-    print(f"Training Window (first 70%): {len(training_window):,} samples")
-    print(f"Later Window (last 30%):     {len(later_window):,} samples")
+    
+    data_dir = Path("data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    train_path = data_dir / "train_window.csv"
+    later_path = data_dir / "later_window.csv"
+
+    training_window.to_csv(train_path, index=False)
+    later_window.to_csv(later_path, index=False)
+
+    print(f"Training Window Shape: {training_window.shape}")
+    print(f"Later Window Shape:    {later_window.shape}")
+
     if "Time" in df.columns:
         print(
             f"  Training Window Time: [{training_window['Time'].min():.1f}s, {training_window['Time'].max():.1f}s]"
@@ -123,8 +133,12 @@ def run_eda(data_path: Path) -> None:
         tr_pct = (tr_fraud / len(training_window)) * 100 if len(training_window) > 0 else 0
         lt_fraud = int(later_window["Class"].sum())
         lt_pct = (lt_fraud / len(later_window)) * 100 if len(later_window) > 0 else 0
-        print(f"  Training Window Fraud: {tr_fraud:,} ({tr_pct:.4f}%)")
-        print(f"  Later Window Fraud:    {lt_fraud:,} ({lt_pct:.4f}%)")
+        print(f"Training Window Fraud Count: {tr_fraud:,} ({tr_pct:.4f}%)")
+        print(f"Later Window Fraud Count:    {lt_fraud:,} ({lt_pct:.4f}%)")
+
+    print(f"\nSaved CSV splits:")
+    print(f"  - {train_path}")
+    print(f"  - {later_path}")
 
     print("\n" + "=" * 80)
     print("EDA Complete.")
