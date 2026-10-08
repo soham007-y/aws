@@ -4,4 +4,5 @@ This directory stores trained model artifacts, weights, and evaluation metadata 
 
 ### Expected Artifacts:
 - `xgboost_baseline.json` / `xgboost_baseline.joblib`: Supervised baseline XGBoost classifier with class weighting (`scale_pos_weight`).
-- `model_metadata.json`: Feature schema, training window config, scaling factors, and evaluation metrics (PR-AUC, ROC-AUC, Recall).
+- `isolation_forest.joblib`: Unsupervised baseline Isolation Forest model trained strictly on normal transactions.
+- `model_metadata.json` / `isolation_forest_metadata.json`: Feature schemas, training window configs, and evaluation metrics (PR-AUC, ROC-AUC, Recall).
