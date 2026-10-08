@@ -15,54 +15,56 @@ from imblearn.over_sampling import SMOTE
 
 
 # ==============================================================================
-# DETAILED INLINE RATIONALE: WHY NAIVE OVERSAMPLING FAILS FOR EXTREME FRAUD IMBALANCE
+# DETAILED INLINE RATIONALE: WHY NAIVE OVERSAMPLING ALONE IS INSUFFICIENT
+# FOR EXTREME FINANCIAL FRAUD IMBALANCE
 # ==============================================================================
 #
-# In extreme financial fraud datasets (e.g., Credit Card Fraud where fraud is ~0.17%
-# or ~1:578 ratio), naive Random Over-Sampling (ROS) simply duplicates existing
-# fraudulent transactions with replacement until parity (50:50) is reached.
+# In extreme financial fraud datasets (such as Kaggle Credit Card Fraud where fraud
+# constitutes only ~0.17% of transactions or a ~1:578 ratio), naive Random Over-Sampling (ROS)
+# simply duplicates existing minority (fraudulent) transactions with replacement until parity
+# or a higher balance is reached.
 #
-# This naive approach fundamentally fails in production fraud systems for several reasons:
+# This naive approach fundamentally fails in production financial fraud detection systems for several critical reasons:
 #
 # 1. Severe Overfitting & Exact Memorization:
-#    - Duplicating ~350-400 fraud instances hundreds of times forces tree-based
-#      ensembles (XGBoost, LightGBM, Random Forest) and deep nets to build ultra-specific
-#      decision leaves around exact duplicate coordinates in feature space.
-#    - The model memorizes exact noise and idiosyncrasies of historical frauds rather than
-#      learning generalizable decision boundaries across feature distributions.
+#    - Duplicating ~350-400 fraud instances hundreds of times forces tree-based ensembles
+#      (e.g., XGBoost, LightGBM, Random Forest) and neural networks to create ultra-specific,
+#      tight decision boundaries around exact duplicate coordinates in feature space.
+#    - The model memorizes exact noise and unique quirks of specific past fraud instances
+#      rather than learning generalizable decision boundaries across the feature distribution.
 #
 # 2. Catastrophic False Positive Rates (FPR) in Production:
-#    - Artificially forcing a 50:50 balance dramatically distorts the empirical prior
+#    - Artificially forcing a 50:50 or heavy oversample distorts the empirical prior
 #      probability P(Fraud) from 0.0017 to 0.50.
 #    - Calibrated posterior probabilities P(Fraud | X) become massively inflated.
-#    - When deployed against millions of legitimate daily transactions, the model
-#      triggers thousands of false alarms, overwhelming fraud investigation teams
-#      and alienating genuine cardholders.
+#    - When deployed against millions of legitimate daily transactions, the model triggers
+#      thousands of false alarms, overwhelming fraud investigation ops and alienating genuine cardholders.
 #
-# 3. Inability to Bridge Sparse Minority Space:
-#    - Naive duplication creates dense point-mass spikes at existing points without
-#      exploring the manifold between fraud samples.
-#    - SMOTE partially addresses this by creating synthetic samples along line segments
-#      connecting k-nearest minority neighbors in feature space.
+# 3. Inability to Explore Sparse Minority Manifold:
+#    - Naive duplication creates dense point-mass spikes at existing sample locations
+#      without exploring the manifold or feature space between fraud instances.
+#    - SMOTE (Synthetic Minority Over-sampling Technique) addresses this by creating synthetic
+#      samples along line segments connecting k-nearest minority neighbors in feature space.
 #
-# 4. The Danger of Aggressive 50:50 SMOTE & Why Hybrid (SMOTE + Class Weighting) Wins:
-#    - If SMOTE is used naively to synthesize fraud all the way up to 50% (generating
-#      ~200,000 synthetic fraud instances), it generates points directly inside majority-class
-#      dense clusters whenever minority outliers or label errors exist ("synthetic noise").
-#    - Best Practice Hybrid Strategy:
-#      * Use mild/moderate SMOTE (e.g., sampling_strategy=0.1, raising fraud to ~1:10) to
+# 4. The Superiority of Hybrid Strategy (Moderate SMOTE + Class Weighting):
+#    - Aggressive 50:50 SMOTE generates synthetic noise inside dense majority clusters whenever
+#      minority outliers or label noise exist.
+#    - Recommended Hybrid Approach:
+#      * Use mild/moderate SMOTE (e.g., sampling_strategy=0.10, raising fraud to ~1:10) to
 #        densify the sparse minority region and establish local connectivity.
 #      * Combine with algorithmic minority class weighting (e.g., scale_pos_weight in XGBoost
-#        or cost-sensitive loss penalties) to penalize missed frauds without polluting
-#        the feature space with hundreds of thousands of artificial data points.
+#        or cost-sensitive loss penalties) to heavily penalize missed frauds during loss optimization
+#        without inflating dataset size with hundreds of thousands of artificial data points.
 # ==============================================================================
 
 
-def find_dataset(default_filename: str = "creditcard.csv") -> Path | None:
+def find_dataset(default_filename: str = "train_window.csv") -> Path | None:
     """Search for the dataset in common project paths."""
     candidates = [
-        Path(default_filename),
         Path("data") / default_filename,
+        Path(default_filename),
+        Path("data") / "creditcard.csv",
+        Path("creditcard.csv"),
         Path("..") / default_filename,
     ]
     for path in candidates:
@@ -72,11 +74,11 @@ def find_dataset(default_filename: str = "creditcard.csv") -> Path | None:
 
 
 def chronological_split(
-    df: pd.DataFrame, train_ratio: float = 0.70
+    df: pd.DataFrame, train_ratio: float = 0.80
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Chronologically split the dataset into a 'training_window' (first 70%)
-    and a 'later_window' (last 30%) to simulate time drift without shuffling.
+    Chronologically split dataset into training (first 80%) and validation (remaining 20%)
+    without shuffling to simulate temporal sequence.
     """
     if "Time" in df.columns:
         df_sorted = df.sort_values(by="Time").reset_index(drop=True)
@@ -84,21 +86,22 @@ def chronological_split(
         df_sorted = df.reset_index(drop=True)
 
     split_idx = int(len(df_sorted) * train_ratio)
-    training_window = df_sorted.iloc[:split_idx].copy()
-    later_window = df_sorted.iloc[split_idx:].copy()
+    train_df = df_sorted.iloc[:split_idx].copy()
+    val_df = df_sorted.iloc[split_idx:].copy()
 
-    return training_window, later_window
+    return train_df, val_df
 
 
 def preprocess_data(
     data_path: Path,
+    val_ratio: float = 0.20,
     smote_ratio: float = 0.10,
     random_state: int = 42,
-    output_dir: Path | None = None,
+    output_dir: Path | None = Path("data"),
 ) -> dict[str, object]:
     """
-    Loads dataset, performs chronological split, scales features, and applies
-    SMOTE combined with minority class weighting on the training window only.
+    Loads data, splits into train/validation windows, scales numerical features,
+    applies SMOTE and class weighting on the training split, and saves preprocessed artifacts.
     """
     print("=" * 80)
     print(f"Loading dataset from: {data_path}")
@@ -111,21 +114,24 @@ def preprocess_data(
         sys.exit(1)
 
     if "Class" not in df.columns:
-        print("Error: 'Class' target column missing.", file=sys.stderr)
+        print("Error: 'Class' target column missing from dataset.", file=sys.stderr)
         sys.exit(1)
 
-    # 1. Chronological Split (No Shuffling to prevent temporal data leakage)
-    training_window, later_window = chronological_split(df, train_ratio=0.70)
-    print(f"\n[Split] Chronological Split:")
-    print(f"  Training Window (70%): {len(training_window):,} rows")
-    print(f"  Later Window    (30%): {len(later_window):,} rows")
+    # 1. Train / Validation Chronological Split
+    train_ratio = 1.0 - val_ratio
+    train_df, val_df = chronological_split(df, train_ratio=train_ratio)
+    print(f"\n[Split] Dataset Split (Train: {train_ratio:.0%}, Val: {val_ratio:.0%}):")
+    print(f"  Training Split:   {train_df.shape[0]:,} rows, {train_df.shape[1]} columns")
+    print(f"  Validation Split: {val_df.shape[0]:,} rows, {val_df.shape[1]} columns")
 
     # 2. Separate Features and Target
-    X_train = training_window.drop(columns=["Class"]).copy()
-    y_train = training_window["Class"].astype(int).values
+    X_train = train_df.drop(columns=["Class"]).copy()
+    y_train = train_df["Class"].astype(int).values
 
-    X_later = later_window.drop(columns=["Class"]).copy()
-    y_later = later_window["Class"].astype(int).values
+    X_val = val_df.drop(columns=["Class"]).copy()
+    y_val = val_df["Class"].astype(int).values
+
+    feature_names = list(X_train.columns)
 
     print("\n[Original Training Distribution]")
     train_counts = pd.Series(y_train).value_counts().to_dict()
@@ -138,27 +144,24 @@ def preprocess_data(
     # V1-V28 are PCA transformed features.
     # 'Amount' exhibits heavy right skew with extreme outliers -> RobustScaler
     # 'Time' represents elapsed seconds -> StandardScaler
-    feature_names = list(X_train.columns)
     scalers: dict[str, object] = {}
 
     if "Amount" in X_train.columns:
         amount_scaler = RobustScaler()
         X_train["Amount"] = amount_scaler.fit_transform(X_train[["Amount"]])
-        X_later["Amount"] = amount_scaler.transform(X_later[["Amount"]])
+        X_val["Amount"] = amount_scaler.transform(X_val[["Amount"]])
         scalers["Amount"] = amount_scaler
 
     if "Time" in X_train.columns:
         time_scaler = StandardScaler()
         X_train["Time"] = time_scaler.fit_transform(X_train[["Time"]])
-        X_later["Time"] = time_scaler.transform(X_later[["Time"]])
+        X_val["Time"] = time_scaler.transform(X_val[["Time"]])
         scalers["Time"] = time_scaler
 
     X_train_scaled = X_train.values
-    X_later_scaled = X_later.values
+    X_val_scaled = X_val.values
 
-    # 4. SMOTE on Training Window Only (Never resample test/validation data!)
-    # We apply moderate SMOTE (e.g. sampling_strategy=0.10) to create synthetic connectivity
-    # without overwhelming feature space with synthetic noise.
+    # 4. SMOTE Resampling on Training Split Only
     print(f"\n[SMOTE Resampling]")
     print(f"  Target sampling_strategy: {smote_ratio} (Fraud to Legitimate ratio)")
     smote = SMOTE(sampling_strategy=smote_ratio, random_state=random_state)
@@ -170,8 +173,7 @@ def preprocess_data(
     new_ratio = resampled_counts.get(0, 0) / max(resampled_counts.get(1, 0), 1)
     print(f"  Resampled Imbalance:      {new_ratio:.2f} : 1")
 
-    # 5. Class Weighting Calculation
-    # Compute balanced weights to adjust loss function penalties during training
+    # 5. Minority Class Weighting Calculation
     classes = np.unique(y_train_resampled)
     balanced_weights = compute_class_weight(
         class_weight="balanced",
@@ -179,27 +181,53 @@ def preprocess_data(
         y=y_train_resampled,
     )
     class_weight_dict = {cls: weight for cls, weight in zip(classes, balanced_weights)}
-
-    # XGBoost scale_pos_weight formula: negative_count / positive_count
     scale_pos_weight = resampled_counts.get(0, 0) / max(resampled_counts.get(1, 0), 1)
 
     print("\n[Minority Class Weighting Configuration]")
     print(f"  Class Weights (balanced): {class_weight_dict}")
     print(f"  XGBoost scale_pos_weight: {scale_pos_weight:.4f}")
 
-    # 6. Save preprocessed artifacts if output directory is provided
+    # 6. Save preprocessed artifacts in data/ folder
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
-        save_path = output_dir / "preprocessed_data.npz"
+
+        # Save CSV files as requested
+        train_preprocessed_df = pd.DataFrame(X_train_resampled, columns=feature_names)
+        train_preprocessed_df["Class"] = y_train_resampled
+        train_csv_path = output_dir / "train_preprocessed.csv"
+        train_preprocessed_df.to_csv(train_csv_path, index=False)
+
+        val_preprocessed_df = pd.DataFrame(X_val_scaled, columns=feature_names)
+        val_preprocessed_df["Class"] = y_val
+        val_csv_path = output_dir / "val_preprocessed.csv"
+        val_preprocessed_df.to_csv(val_csv_path, index=False)
+
+        # Compressed .npz archives for fast downstream model loading
+        npz_path = output_dir / "preprocessed_data.npz"
         np.savez_compressed(
-            save_path,
+            npz_path,
             X_train_resampled=X_train_resampled,
             y_train_resampled=y_train_resampled,
-            X_later_scaled=X_later_scaled,
-            y_later=y_later,
+            X_later_scaled=X_val_scaled,
+            y_later=y_val,
             scale_pos_weight=np.array([scale_pos_weight]),
         )
-        print(f"\n[Artifacts] Preprocessed splits saved to: {save_path}")
+
+        processed_dir = output_dir / "processed"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            processed_dir / "preprocessed_data.npz",
+            X_train_resampled=X_train_resampled,
+            y_train_resampled=y_train_resampled,
+            X_later_scaled=X_val_scaled,
+            y_later=y_val,
+            scale_pos_weight=np.array([scale_pos_weight]),
+        )
+
+        print(f"\n[Artifacts Saved in {output_dir}/]:")
+        print(f"  - Preprocessed Training CSV:   {train_csv_path} ({train_preprocessed_df.shape})")
+        print(f"  - Preprocessed Validation CSV: {val_csv_path} ({val_preprocessed_df.shape})")
+        print(f"  - Compressed Archive:          {npz_path}")
 
     print("\n" + "=" * 80)
     print("Preprocessing & SMOTE Class Weighting Pipeline Complete.")
@@ -208,8 +236,8 @@ def preprocess_data(
     return {
         "X_train_resampled": X_train_resampled,
         "y_train_resampled": y_train_resampled,
-        "X_later_scaled": X_later_scaled,
-        "y_later": y_later,
+        "X_val_scaled": X_val_scaled,
+        "y_val": y_val,
         "class_weight_dict": class_weight_dict,
         "scale_pos_weight": scale_pos_weight,
         "feature_names": feature_names,
@@ -218,13 +246,19 @@ def preprocess_data(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Preprocess Credit Card Fraud dataset with chronological split, scaling, and SMOTE class weighting"
+        description="Preprocess Credit Card Fraud dataset with scaling, SMOTE, and class weighting"
     )
     parser.add_argument(
         "--data-path",
         type=str,
         default=None,
-        help="Path to creditcard.csv (defaults to auto-detection)",
+        help="Path to dataset (defaults to auto-detecting data/train_window.csv)",
+    )
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.20,
+        help="Validation split ratio (default: 0.20)",
     )
     parser.add_argument(
         "--smote-ratio",
@@ -241,8 +275,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="data/processed",
-        help="Directory to save preprocessed splits (default: data/processed)",
+        default="data",
+        help="Directory to save preprocessed splits (default: data)",
     )
     args = parser.parse_args()
 
@@ -250,13 +284,14 @@ def main():
 
     if target_path is None or not target_path.exists():
         print("Dataset not found!", file=sys.stderr)
-        print("Please place 'creditcard.csv' in the project directory or 'data/' folder,", file=sys.stderr)
-        print("or specify with --data-path <path/to/creditcard.csv>.", file=sys.stderr)
+        print("Please ensure 'data/train_window.csv' exists (run 01_eda.py first),", file=sys.stderr)
+        print("or specify path with --data-path <path/to/dataset.csv>.", file=sys.stderr)
         sys.exit(1)
 
-    out_dir = Path(args.output_dir) if args.output_dir else None
+    out_dir = Path(args.output_dir) if args.output_dir else Path("data")
     preprocess_data(
         data_path=target_path,
+        val_ratio=args.val_ratio,
         smote_ratio=args.smote_ratio,
         random_state=args.random_state,
         output_dir=out_dir,
