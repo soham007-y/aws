@@ -23,6 +23,25 @@ def find_dataset(default_filename: str = "creditcard.csv") -> Path | None:
     return None
 
 
+def chronological_split(
+    df: pd.DataFrame, train_ratio: float = 0.70
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Chronologically split the dataset into a 'training_window' (first 70%)
+    and a 'later_window' (last 30%) to simulate time drift, ensuring data is not shuffled.
+    """
+    if "Time" in df.columns:
+        df_sorted = df.sort_values(by="Time").reset_index(drop=True)
+    else:
+        df_sorted = df.reset_index(drop=True)
+
+    split_idx = int(len(df_sorted) * train_ratio)
+    training_window = df_sorted.iloc[:split_idx].copy()
+    later_window = df_sorted.iloc[split_idx:].copy()
+
+    return training_window, later_window
+
+
 def run_eda(data_path: Path) -> None:
     """Load dataset, print basic statistics, and compute class imbalance."""
     print("=" * 80)
@@ -87,6 +106,25 @@ def run_eda(data_path: Path) -> None:
         amount_stats = df.groupby("Class")["Amount"].agg(["count", "mean", "std", "median", "min", "max"])
         amount_stats.index = ["Legitimate (0)", "Fraud (1)"] if len(amount_stats) == 2 else amount_stats.index
         print(amount_stats.to_string())
+
+    print("\n--- 6. Chronological Split (Time Drift Simulation) ---")
+    training_window, later_window = chronological_split(df)
+    print(f"Training Window (first 70%): {len(training_window):,} samples")
+    print(f"Later Window (last 30%):     {len(later_window):,} samples")
+    if "Time" in df.columns:
+        print(
+            f"  Training Window Time: [{training_window['Time'].min():.1f}s, {training_window['Time'].max():.1f}s]"
+        )
+        print(
+            f"  Later Window Time:    [{later_window['Time'].min():.1f}s, {later_window['Time'].max():.1f}s]"
+        )
+    if "Class" in df.columns:
+        tr_fraud = int(training_window["Class"].sum())
+        tr_pct = (tr_fraud / len(training_window)) * 100 if len(training_window) > 0 else 0
+        lt_fraud = int(later_window["Class"].sum())
+        lt_pct = (lt_fraud / len(later_window)) * 100 if len(later_window) > 0 else 0
+        print(f"  Training Window Fraud: {tr_fraud:,} ({tr_pct:.4f}%)")
+        print(f"  Later Window Fraud:    {lt_fraud:,} ({lt_pct:.4f}%)")
 
     print("\n" + "=" * 80)
     print("EDA Complete.")
