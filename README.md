@@ -1,13 +1,6 @@
 # Financial Fraud Detection & Concept Drift Monitoring Pipeline
 
-An end-to-end, production-grade machine learning architecture for extreme credit card fraud detection (~0.17% minority prevalence), cost-sensitive decision optimization, and temporal concept drift monitoring.
-
----
-
-## Author Information
-
-- **Author**: Soham Sachin Yadav
-- **Registration Number**: 26BIT0259
+An end-to-end, production-grade machine learning system for extreme credit card fraud detection (~0.17% minority prevalence), cost-sensitive decision optimization, and temporal concept drift monitoring.
 
 ---
 
@@ -24,7 +17,7 @@ An end-to-end, production-grade machine learning architecture for extreme credit
               ┌───────────────────────┴───────────────────────┐
               ▼                                               ▼
    Training Window (First 70%)                     Later Window (Last 30%)
-   [Robust & Standard Scalers]                     [Temporal Evaluation Set]
+   [199,364 samples]                               [85,443 samples]
               │                                               │
    Controlled SMOTE (0.10)                                    │
    + Class Weights (scale_pos_weight)                         │
@@ -32,19 +25,22 @@ An end-to-end, production-grade machine learning architecture for extreme credit
       ┌───────┴────────────────────────┐                      │
       ▼                                ▼                      │
 Supervised XGBoost           Unsupervised Isolation           │
-[Hist Gradient Boosting]     Forest (Normal Txns Only)        │
+[Cost-Sensitive Classifier]  Forest (Normal Txns Only)        │
       │                                │                      │
       └───────┬────────────────────────┘                      │
               ▼                                               ▼
    ┌──────────────────────────────────────────────────────────────┐
-   │ 04_evaluate.py: PR-AUC & Business Loss Threshold Optimizer   │
-   │  * Cost: $10/FP (friction) vs $Amount/FN (fraud loss)       │
+   │ 04_evaluate.py: PR-AUC & Business Cost Threshold Optimizer   │
+   │  * Custom Cost: $10/FP (friction) vs $Amount/FN (fraud loss) │
+   │  * Sweeps cutoffs (0.01 to 0.99) to find minimum dollar loss │
    └──────────────────────────────┬───────────────────────────────┘
                                   │
                                   ▼
    ┌──────────────────────────────────────────────────────────────┐
    │ 05_drift_monitor.py: Kolmogorov-Smirnov (KS) Drift Alerts    │
-   │  * Retraining trigger: KS > 0.05 on > 3 critical features   │
+   │  * Two-sample KS test across V1-V28 and Amount               │
+   │  * Prediction confidence distribution shift check            │
+   │  * Retraining alert triggered if > 3 critical features drift │
    └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -56,103 +52,121 @@ Supervised XGBoost           Unsupervised Isolation           │
 ├── 01_eda.py              # Exploratory data analysis & chronological partition
 ├── 02_preprocess.py       # Scalers, controlled SMOTE, & class weighting
 ├── 03_modeling.py         # Supervised XGBoost & Unsupervised Isolation Forest
-├── 04_evaluate.py         # PR-AUC & custom business loss threshold sweep
+├── 04_evaluate.py         # PR-AUC evaluation & business cost threshold sweep
 ├── 05_drift_monitor.py    # Two-sample KS test drift monitor & alert engine
 ├── requirements.txt       # Production dependencies
-├── WRITEUP.md             # In-depth architectural & theoretical methodology
+├── WRITEUP.md             # In-depth architectural & theoretical technical report
 ├── README.md              # Documentation & reproduction guide
-└── models/                # Serialized model artifacts, weights & JSON logs
+├── data/                  # Generated chronological splits & preprocessed data (git-ignored)
+│   ├── train_window.csv
+│   ├── later_window.csv
+│   ├── train_preprocessed.csv
+│   └── val_preprocessed.csv
+└── models/                # Serialized model artifacts, weights & JSON reports
     ├── xgboost_baseline.joblib
     ├── xgboost_baseline.json
     ├── isolation_forest.joblib
-    ├── model_metadata.json
-    ├── isolation_forest_metadata.json
     ├── evaluation_results.json
     └── drift_report.json
 ```
 
 ---
 
-## Installation & Setup
+## Setup & Installation
 
 ### 1. Prerequisites
-- Python 3.9+
+- Python 3.10+
 - Kaggle Credit Card Fraud dataset: [`creditcard.csv`](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud)
 
-### 2. Virtual Environment Setup
+### 2. Create & Activate Virtual Environment
 ```bash
 # Clone the repository
 git clone https://github.com/soham007-y/aws.git
 cd aws
 
-# Create and activate virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Create virtual environment
+python3 -m venv .venv
 
-# Install dependencies
+# Activate virtual environment
+# On macOS / Linux:
+source .venv/bin/activate
+# On Windows:
+# .venv\Scripts\activate
+```
+
+### 3. Install Dependencies
+```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Place Dataset
-Place `creditcard.csv` in the root workspace directory or inside a `data/` folder:
+### 4. Dataset Placement
+Place `creditcard.csv` directly in the root project directory or inside the `data/` folder:
 ```bash
-# Verify placement
-ls -l creditcard.csv
+# Verify dataset placement
+ls -lh creditcard.csv
 # or
-mkdir -p data && mv /path/to/creditcard.csv data/creditcard.csv
+ls -lh data/creditcard.csv
 ```
 
 ---
 
-## Pipeline Execution & Reproduction
+## Step-by-Step Reproduction Guide
 
-Run each stage sequentially to reproduce the end-to-end evaluation:
+Execute the scripts sequentially from `01_eda.py` through `05_drift_monitor.py` to reproduce the entire pipeline:
 
-### Step 1: Exploratory Data Analysis & Imbalance Audit
-Calculates exact class imbalance, distribution summaries, and chronological window statistics:
+### Step 1: Exploratory Data Analysis & Chronological Split
+Performs dataset audit, computes exact class imbalance (~1:578 ratio), and splits data chronologically (first 70% training, last 30% operational) without shuffling:
 ```bash
-python3 01_eda.py --data-path creditcard.csv
+python 01_eda.py
 ```
+*Output artifacts:* `data/train_window.csv` (199,364 rows) and `data/later_window.csv` (85,443 rows).
 
-### Step 2: Preprocessing, Scaling & Controlled SMOTE
-Applies `RobustScaler` on `Amount`, `StandardScaler` on `Time`, controlled SMOTE (`sampling_strategy=0.10`), and calculates XGBoost `scale_pos_weight`:
+### Step 2: Feature Preprocessing, Scaling & Hybrid SMOTE
+Scales numerical features (`RobustScaler` for `Amount`, `StandardScaler` for `Time`), applies controlled SMOTE (`sampling_strategy=0.10`) on the training split, and computes balanced class weights:
 ```bash
-python3 02_preprocess.py --data-path creditcard.csv --output-dir data/processed
+python 02_preprocess.py
 ```
+*Output artifacts:* `data/train_preprocessed.csv`, `data/val_preprocessed.csv`, and `data/preprocessed_data.npz`.
 
-### Step 3: Model Training (Supervised XGBoost + Unsupervised Isolation Forest)
-Trains both models and serializes artifacts into the `models/` directory:
+### Step 3: Model Training (Supervised XGBoost & Isolation Forest)
+Trains the cost-sensitive Supervised XGBoost classifier and the Unsupervised Isolation Forest (strictly on normal transactions):
 ```bash
-python3 03_modeling.py --data-path creditcard.csv --models-dir models --pipeline all
+python 03_modeling.py
 ```
-*Optional pipeline flags:*
-- `--pipeline xgboost`: Train only the supervised XGBoost classifier.
-- `--pipeline isolation_forest`: Train only the unsupervised Isolation Forest.
+*Output artifacts:* `models/xgboost_baseline.joblib`, `models/xgboost_baseline.json`, and `models/isolation_forest.joblib`.
 
 ### Step 4: PR-AUC Evaluation & Business Cost Threshold Optimization
-Evaluates PR-AUC on the chronological later window and executes a threshold sweep minimizing total dollar loss ($\$10$ FP friction vs. $\$ \text{Amount}$ FN fraud loss):
+Evaluates Precision-Recall AUC (prioritized over ROC-AUC) on the validation split and runs a decision threshold sweep (0.01 to 0.99) minimizing total business financial impact ($10 FP friction vs. actual transaction Amount FN loss):
 ```bash
-python3 04_evaluate.py --data-path creditcard.csv --models-dir models --cost-fp 10.0
+python 04_evaluate.py
 ```
+*Output:* PR-AUC scores, optimal threshold cutoff (0.80 for XGBoost), and financial savings ($600 savings vs default 0.50 cutoff). Saves `models/evaluation_results.json`.
 
-### Step 5: Kolmogorov-Smirnov Feature Drift Monitoring & Retraining Alerts
-Runs two-sample KS statistical tests between training and later operational windows, testing for distribution divergence across critical features (`V14`, `V17`, `V12`, `V10`, `V4`, `V11`, `V2`, `Amount`):
+### Step 5: Feature & Prediction Confidence Drift Monitoring
+Runs the two-sample Kolmogorov-Smirnov (KS) test across all numeric features (`V1` through `V28` and `Amount`), tests for prediction confidence distribution shift, logs a summary table, and triggers an automated retraining alert:
 ```bash
-python3 05_drift_monitor.py --data-path creditcard.csv --drift-threshold 0.05 --max-critical-drift 3
+python 05_drift_monitor.py
 ```
+*Output:* Drift summary table, confidence distribution metrics, and automated retraining alert. Saves `models/drift_report.json`.
 
 ---
 
-## Key Metrics & Configuration Summary
+## Key Pipeline Results Summary
 
-| Component | Strategy / Hyperparameter | Production Value |
-| :--- | :--- | :--- |
-| **Chronological Split** | Temporal partition (no shuffle) | First 70% Train / Last 30% Evaluation |
-| **Resampling** | Controlled SMOTE | `sampling_strategy = 0.10` |
-| **Class Weighting** | Cost-sensitive gradient scaling | `scale_pos_weight = N_neg / N_pos` |
-| **Supervised Model** | Histogram Gradient Boosted Trees | `XGBClassifier(eval_metric='aucpr', max_depth=5)` |
-| **Unsupervised Model** | Isolation Forest (inliers only) | `IsolationForest(contamination=0.0017, max_samples=256)` |
-| **Primary Metric** | Precision-Recall AUC (PR-AUC) | Isolates minority class without TN dilution |
-| **Business Cost Function** | Minimization of operational cost | $\text{Cost} = 10 \times \text{FP} + \sum \text{Amount}_{\text{FN}}$ |
-| **Drift Monitoring** | Two-Sample Kolmogorov-Smirnov Test | Trigger alert when $\text{KS} > 0.05$ on $> 3$ critical features |
+| Metric / Pipeline Step | Value / Configuration |
+| :--- | :--- |
+| **Chronological Split** | 70% Training Window / 30% Later Window |
+| **Minority Class Imbalance** | 0.1727% (1 fraud in every ~579 transactions) |
+| **Hybrid Resampling Strategy** | SMOTE (`sampling_strategy=0.10`) + `scale_pos_weight=10.0` |
+| **Supervised XGBoost PR-AUC** | **0.6556** (ROC-AUC: 0.9627) |
+| **Unsupervised Isolation Forest PR-AUC** | **0.0146** (ROC-AUC: 0.9554) |
+| **Optimal XGBoost Threshold** | **0.80** (Min Total Business Cost: $3,823.96 vs $4,423.96 @ 0.50) |
+| **Drift Alert Trigger** | **FLAGGED FOR AUTOMATIC RETRAINING** (8 critical features drifted, confidence shifted) |
+
+---
+
+## Author
+
+- **Name**: Soham Sachin Yadav
+- **Registration Number**: 26BIT0259
