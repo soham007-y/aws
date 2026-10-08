@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-04_evaluate.py - PR-AUC Evaluation & Business Cost-Benefit Threshold Optimization
-Evaluates Supervised XGBoost and Unsupervised Isolation Forest on the chronological validation/test set.
-Implements custom financial loss function:
-  - False Positive (FP): $10 friction cost (customer disruption & analyst review)
-  - False Negative (FN): Actual transaction amount in USD (fraud loss)
-Finds the optimal decision threshold that minimizes total business cost.
+04_evaluate.py - Precision-Recall AUC Evaluation & Cost-Benefit Threshold Optimization
+Evaluates Supervised XGBoost and Unsupervised Isolation Forest on validation data.
+Implements custom business cost function:
+  - False Positive (FP): $10 in customer friction / investigation cost
+  - False Negative (FN): Actual transaction Amount in unrecovered fraud losses
+Sweeps decision thresholds (0.01 to 0.99) to find the cutoff that minimizes total business cost.
 """
 
 import argparse
@@ -16,98 +16,110 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     average_precision_score,
-    classification_report,
     confusion_matrix,
-    precision_recall_curve,
     roc_auc_score,
 )
 import joblib
 
-# Dynamic module loading for custom scripts
-import importlib.util
+
+# ==============================================================================
+# INLINE COMMENTARY: WHY PR-AUC IS PRIORITIZED OVER ROC-AUC FOR EXTREME FRAUD IMBALANCE
+# ==============================================================================
+#
+# In extreme class imbalance settings (e.g., credit card fraud where the minority
+# fraud class constitutes only ~0.17% of total transactions), ROC-AUC is fundamentally
+# poorly adapted and becomes falsely optimistic due to the massive volume of True Negatives (TN).
+#
+# Mathematical Reason:
+# - ROC Curve evaluates False Positive Rate (FPR) vs. True Positive Rate (TPR / Recall):
+#       FPR = FP / (FP + TN)
+#   Because TN is colossal (tens or hundreds of thousands of legitimate transactions),
+#   the denominator (FP + TN) is overwhelming. Even if the model generates hundreds of
+#   false alarms (high FP), FPR remains tiny (e.g., FPR < 0.005).
+#   Consequently, the ROC curve appears nearly ideal (ROC-AUC > 0.95), masking disastrous
+#   precision degradation in production.
+#
+# - PR Curve evaluates Precision vs. Recall:
+#       Precision = TP / (TP + FP)
+#       Recall    = TP / (TP + FN)
+#   Precision directly pits False Positives against True Positives, completely
+#   unaffected by the massive number of True Negatives. If the model flags 100 transactions
+#   to catch 5 frauds (95 false alarms), Precision plunges to 5%, which PR-AUC
+#   immediately exposes.
+#
+# Therefore, Precision-Recall AUC (PR-AUC) is prioritized as the primary metric for
+# model selection and performance evaluation in financial fraud detection.
+# ==============================================================================
 
 
-def load_module_from_file(module_name: str, file_path: Path):
-    """Dynamically loads a python file as a module."""
-    if file_path.exists():
-        spec = importlib.util.spec_from_file_location(module_name, file_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    return None
-
-
-current_dir = Path(__file__).parent
-preprocess_mod = load_module_from_file("preprocess_mod", current_dir / "02_preprocess.py")
-modeling_mod = load_module_from_file("modeling_mod", current_dir / "03_modeling.py")
-
-
-def load_evaluation_data(
-    data_path: Path | None = None,
-    preprocessed_path: Path | None = None,
-) -> dict[str, np.ndarray]:
+def load_validation_data(
+    val_path: Path | None = None,
+    train_window_path: Path | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """
-    Loads evaluation data (later_window / validation split):
-    - Features: X_val (scaled)
-    - Ground truth labels: y_val (0 or 1)
-    - Real transaction amounts: amounts_val (unscaled dollar amounts for cost calculation)
+    Loads validation features, ground truth labels, and unscaled transaction amounts.
+    Returns:
+        (X_val, y_val, amounts_val, feature_names)
     """
-    # 1. Check if raw dataset is available (gives exact unscaled amounts)
-    raw_path = data_path if data_path else (preprocess_mod.find_dataset() if preprocess_mod else None)
-    if raw_path and raw_path.exists():
-        print(f"Loading validation set from raw dataset: {raw_path}")
-        df = pd.read_csv(raw_path)
-        training_window, later_window = preprocess_mod.chronological_split(df, train_ratio=0.70)
+    val_csv = val_path if val_path else Path("data/val_preprocessed.csv")
+    tw_csv = train_window_path if train_window_path else Path("data/train_window.csv")
 
-        # Scale features using training window fit (replicating 02_preprocess)
-        from sklearn.preprocessing import RobustScaler, StandardScaler
+    if val_csv.exists():
+        print(f"Loading preprocessed validation split from: {val_csv}")
+        val_df = pd.read_csv(val_csv)
 
-        X_train = training_window.drop(columns=["Class"]).copy()
-        X_val = later_window.drop(columns=["Class"]).copy()
-        y_val = later_window["Class"].astype(int).values
-        amounts_val = later_window["Amount"].values.astype(float)
+        if "Class" not in val_df.columns:
+            print("Error: 'Class' column missing from validation dataset.", file=sys.stderr)
+            sys.exit(1)
 
-        if "Amount" in X_train.columns:
-            scaler = RobustScaler()
-            scaler.fit(X_train[["Amount"]])
-            X_val["Amount"] = scaler.transform(X_val[["Amount"]])
+        X_val_df = val_df.drop(columns=["Class"])
+        y_val = val_df["Class"].astype(int).values
+        feature_names = list(X_val_df.columns)
+        X_val = X_val_df.values
 
-        if "Time" in X_train.columns:
-            scaler = StandardScaler()
-            scaler.fit(X_train[["Time"]])
-            X_val["Time"] = scaler.transform(X_val[["Time"]])
+        # Retrieve exact unscaled transaction amounts for cost function
+        amounts_val = None
+        if tw_csv.exists():
+            tw_df = pd.read_csv(tw_csv)
+            if "Time" in tw_df.columns:
+                tw_df = tw_df.sort_values(by="Time").reset_index(drop=True)
+            if len(tw_df) >= len(val_df):
+                # Validation split corresponds to the chronological tail
+                amounts_val = tw_df.iloc[-len(val_df):]["Amount"].values.astype(float)
 
-        return {
-            "X_val": X_val.values,
-            "y_val": y_val,
-            "amounts_val": amounts_val,
-        }
+        if amounts_val is None or len(amounts_val) != len(y_val):
+            # Fallback to Amount column if unscaled or positive approximation
+            if "Amount" in val_df.columns:
+                amounts_val = np.maximum(val_df["Amount"].values.astype(float), 1.0)
+            else:
+                amounts_val = np.full(len(y_val), 88.0)
 
-    # 2. Check preprocessed .npz archive
-    npz_path = preprocessed_path if preprocessed_path else (Path("data") / "processed" / "preprocessed_data.npz")
-    if npz_path.exists():
-        print(f"Loading preprocessed validation split from: {npz_path}")
-        npz = np.load(npz_path, allow_pickle=True)
-        X_val = npz["X_later_scaled"]
-        y_val = npz["y_later"]
+        return X_val, y_val, amounts_val, feature_names
 
-        # Approximate amounts if raw data is unavailable (Amount is feature index 29 or last feature)
-        # However, for accurate business cost calculation, raw amounts are preferred.
-        amounts_val = np.abs(X_val[:, -2]) * 88.0 + 88.0 if X_val.shape[1] >= 2 else np.ones(len(y_val)) * 100.0
+    # Check compressed npz archive
+    npz_candidates = [
+        Path("data/preprocessed_data.npz"),
+        Path("data/processed/preprocessed_data.npz"),
+    ]
+    for npz_path in npz_candidates:
+        if npz_path.exists():
+            print(f"Loading validation split from archive: {npz_path}")
+            npz = np.load(npz_path, allow_pickle=True)
+            X_val = npz["X_later_scaled"]
+            y_val = npz["y_later"]
+            amounts_val = np.full(len(y_val), 88.0)  # average amount fallback
+            feature_names = [f"feat_{i}" for i in range(X_val.shape[1])]
+            return X_val, y_val, amounts_val, feature_names
 
-        return {
-            "X_val": X_val,
-            "y_val": y_val,
-            "amounts_val": amounts_val,
-        }
-
-    raise FileNotFoundError(
-        "Could not load evaluation data. Please ensure creditcard.csv or data/processed/preprocessed_data.npz exists."
+    print(
+        "Error: Could not locate validation dataset. Please run 01_eda.py and 02_preprocess.py first.",
+        file=sys.stderr,
     )
+    sys.exit(1)
 
 
 # ==============================================================================
-# CUSTOM BUSINESS COST FUNCTION & THRESHOLD OPTIMIZATION
+# BUSINESS COST FUNCTION & THRESHOLD OPTIMIZATION
 # ==============================================================================
 
 
@@ -118,33 +130,33 @@ def compute_business_cost(
     cost_fp: float = 10.0,
 ) -> dict[str, float | int]:
     """
-    Computes total business financial impact:
-    - False Positive (FP): $10 friction cost (customer inconvenience + investigation time)
-    - False Negative (FN): Loss equal to actual fraudulent transaction amount
-    - True Positives (TP): Caught fraud ($0 fraud loss)
-    - True Negatives (TN): Approved genuine transactions ($0 cost)
+    Calculates total business financial impact:
+    - False Positive (FP): $10 friction cost (customer friction + review)
+    - False Negative (FN): Loss equal to actual fraudulent transaction Amount
+    - True Positive (TP): Fraud intercepted ($0 fraud loss)
+    - True Negative (TN): Genuine transaction approved ($0 friction cost)
     """
     is_fraud = (y_true == 1)
     is_pred_fraud = (y_pred == 1)
 
-    # FP: Predicted fraud but actually legitimate
+    # FP: Predicted fraud (1) but actually legitimate (0)
     fp_mask = (~is_fraud) & is_pred_fraud
-    total_fp_cost = float(fp_mask.sum() * cost_fp)
+    fp_cost = float(fp_mask.sum() * cost_fp)
 
-    # FN: Actual fraud missed by model
+    # FN: Actual fraud (1) missed by model (0) -> actual unrecovered fraud amount
     fn_mask = is_fraud & (~is_pred_fraud)
-    total_fn_cost = float(amounts[fn_mask].sum())
+    fn_cost = float(amounts[fn_mask].sum())
 
-    # TP: Actual fraud detected and blocked
+    # TP: Intercepted fraud volume
     tp_mask = is_fraud & is_pred_fraud
     prevented_loss = float(amounts[tp_mask].sum())
 
-    total_cost = total_fp_cost + total_fn_cost
+    total_cost = fp_cost + fn_cost
 
     return {
         "total_cost": total_cost,
-        "fp_cost": total_fp_cost,
-        "fn_cost": total_fn_cost,
+        "fp_cost": fp_cost,
+        "fn_cost": fn_cost,
         "prevented_loss": prevented_loss,
         "fp_count": int(fp_mask.sum()),
         "fn_count": int(fn_mask.sum()),
@@ -158,54 +170,44 @@ def find_optimal_threshold(
     y_scores: np.ndarray,
     amounts: np.ndarray,
     model_name: str,
+    threshold_range: np.ndarray = np.arange(0.01, 1.00, 0.01),
     cost_fp: float = 10.0,
-    num_steps: int = 500,
 ) -> dict[str, object]:
     """
-    Tests a continuous spectrum of candidate decision thresholds to discover
-    the specific cutoff that strictly minimizes total financial business cost.
+    Iterates through candidate decision thresholds (from 0.01 to 0.99)
+    to find the specific cutoff that strictly minimizes total financial business cost.
     """
-    print(f"\nSearching optimal threshold for {model_name}...")
-
-    # Define fine-grained candidate thresholds across [0.001, 0.999]
-    # In fraud detection, optimal cutoffs frequently sit below 0.5 due to heavy FN penalties
-    candidate_thresholds = np.concatenate([
-        np.linspace(0.001, 0.10, num_steps // 2),
-        np.linspace(0.101, 0.999, num_steps // 2),
-    ])
-    candidate_thresholds.sort()
-
-    # Zero-model baseline: no fraud detected (all actual frauds are missed)
     baseline_unmitigated_cost = float(amounts[y_true == 1].sum())
 
-    best_threshold = 0.5
+    best_threshold = 0.50
     min_cost = float("inf")
     best_stats = None
 
-    threshold_curve = []
+    threshold_results = []
 
-    for t in candidate_thresholds:
-        y_pred = (y_scores >= t).astype(int)
+    # Threshold optimization loop
+    for threshold in threshold_range:
+        y_pred = (y_scores >= threshold).astype(int)
         stats = compute_business_cost(y_true, y_pred, amounts, cost_fp=cost_fp)
         cost = stats["total_cost"]
 
-        threshold_curve.append({
-            "threshold": float(t),
+        threshold_results.append({
+            "threshold": round(float(threshold), 4),
             "total_cost": cost,
             "fp_cost": stats["fp_cost"],
             "fn_cost": stats["fn_cost"],
-            "tp": stats["tp_count"],
-            "fp": stats["fp_count"],
-            "fn": stats["fn_count"],
+            "fp_count": stats["fp_count"],
+            "fn_count": stats["fn_count"],
+            "tp_count": stats["tp_count"],
         })
 
         if cost < min_cost:
             min_cost = cost
-            best_threshold = float(t)
+            best_threshold = round(float(threshold), 4)
             best_stats = stats
 
-    # Default 0.5 threshold stats for comparison
-    default_pred = (y_scores >= 0.5).astype(int)
+    # Evaluate default 0.50 cutoff for cost-benefit comparison
+    default_pred = (y_scores >= 0.50).astype(int)
     default_stats = compute_business_cost(y_true, default_pred, amounts, cost_fp=cost_fp)
 
     savings_vs_baseline = baseline_unmitigated_cost - min_cost
@@ -221,80 +223,82 @@ def find_optimal_threshold(
         "baseline_unmitigated_cost": baseline_unmitigated_cost,
         "savings_vs_baseline": savings_vs_baseline,
         "savings_vs_default": savings_vs_default,
+        "threshold_curve": threshold_results,
     }
 
 
 # ==============================================================================
-# EVALUATION RUNNER
+# MAIN EVALUATION RUNNER
 # ==============================================================================
 
 
 def run_evaluation(
-    data_path: Path | None = None,
-    preprocessed_path: Path | None = None,
     models_dir: Path = Path("models"),
+    val_path: Path | None = None,
     cost_fp: float = 10.0,
 ) -> dict[str, object]:
     """
-    Main evaluation pipeline:
-    1. Loads validation data and models.
-    2. Computes Precision-Recall AUC (PR-AUC) and ROC-AUC.
-    3. Runs threshold optimization loop minimizing financial business cost.
-    4. Prints comparative cost-benefit results.
+    Main evaluation routine:
+    1. Loads validation split and trained models.
+    2. Calculates PR-AUC and ROC-AUC.
+    3. Runs threshold optimization loop across [0.01, 0.99].
+    4. Prints evaluation summary and optimal threshold cutoffs.
     """
     print("=" * 80)
-    print("CREDIT CARD FRAUD EVALUATION & BUSINESS COST OPTIMIZATION")
+    print("EVALUATION PIPELINE: PR-AUC & BUSINESS COST THRESHOLD OPTIMIZATION")
     print("=" * 80)
-    print(f"Cost Parameters:")
+    print(f"Business Cost Function Parameters:")
     print(f"  False Positive (FP) friction cost: ${cost_fp:.2f} per transaction")
-    print(f"  False Negative (FN) fraud cost:    Actual transaction amount ($)")
+    print(f"  False Negative (FN) fraud loss:    Actual transaction Amount ($)")
 
-    data = load_evaluation_data(data_path=data_path, preprocessed_path=preprocessed_path)
-    X_val = data["X_val"]
-    y_val = data["y_val"]
-    amounts_val = data["amounts_val"]
+    X_val, y_val, amounts_val, feature_names = load_validation_data(val_path=val_path)
 
-    total_val_transactions = len(y_val)
-    total_val_frauds = int(y_val.sum())
-    total_fraud_volume = float(amounts_val[y_val == 1].sum())
+    total_samples = len(y_val)
+    total_frauds = int(y_val.sum())
+    total_fraud_dollars = float(amounts_val[y_val == 1].sum())
 
-    print(f"\nValidation Set Profile (Chronological Later Window):")
-    print(f"  Total Transactions:   {total_val_transactions:,}")
-    print(f"  Actual Fraud Count:   {total_val_frauds:,} ({(total_val_frauds/total_val_transactions)*100:.4f}%)")
-    print(f"  Total Fraud Volume:   ${total_fraud_volume:,.2f}")
+    print(f"\nValidation Set Statistics:")
+    print(f"  Total Transactions: {total_samples:,}")
+    print(f"  Fraud Transactions: {total_frauds:,} ({total_frauds / total_samples:.4%})")
+    print(f"  Total Fraud Volume: ${total_fraud_dollars:,.2f}")
+    print(f"  Unmitigated Baseline Fraud Loss: ${total_fraud_dollars:,.2f}")
 
     results = {}
+    threshold_range = np.arange(0.01, 1.00, 0.01)
 
-    # --- 1. Supervised XGBoost Evaluation ---
+    # --------------------------------------------------------------------------
+    # 1. Supervised XGBoost Evaluation
+    # --------------------------------------------------------------------------
     xgb_path = models_dir / "xgboost_baseline.joblib"
     if not xgb_path.exists():
         xgb_path = models_dir / "xgboost_baseline.json"
 
     if xgb_path.exists():
         print("\n" + "=" * 80)
-        print("MODEL 1: Supervised XGBoost Evaluation")
+        print("MODEL 1: Supervised XGBoost Classifier")
         print("=" * 80)
 
         if str(xgb_path).endswith(".joblib"):
             xgb_model = joblib.load(xgb_path)
-            xgb_probs = xgb_model.predict_proba(X_val)[:, 1]
+            xgb_scores = xgb_model.predict_proba(X_val)[:, 1]
         else:
             import xgboost as xgb
             xgb_model = xgb.XGBClassifier()
             xgb_model.load_model(xgb_path)
-            xgb_probs = xgb_model.predict_proba(X_val)[:, 1]
+            xgb_scores = xgb_model.predict_proba(X_val)[:, 1]
 
-        xgb_pr_auc = average_precision_score(y_val, xgb_probs)
-        xgb_roc_auc = roc_auc_score(y_val, xgb_probs)
+        xgb_pr_auc = average_precision_score(y_val, xgb_scores)
+        xgb_roc_auc = roc_auc_score(y_val, xgb_scores)
 
-        print(f"  Precision-Recall AUC (PR-AUC): {xgb_pr_auc:.4f}")
-        print(f"  ROC-AUC:                       {xgb_roc_auc:.4f}")
+        print(f"  PR-AUC Score (Prioritized Metric): {xgb_pr_auc:.4f}")
+        print(f"  ROC-AUC Score (Reference Metric):   {xgb_roc_auc:.4f}")
 
         xgb_opt = find_optimal_threshold(
             y_true=y_val,
-            y_scores=xgb_probs,
+            y_scores=xgb_scores,
             amounts=amounts_val,
             model_name="Supervised XGBoost",
+            threshold_range=threshold_range,
             cost_fp=cost_fp,
         )
 
@@ -303,22 +307,32 @@ def run_evaluation(
             "roc_auc": float(xgb_roc_auc),
             "optimization": xgb_opt,
         }
+
+        print(f"\n  [Threshold Optimization Results]:")
+        print(f"    Chosen Optimal Threshold: {xgb_opt['optimal_threshold']:.2f}")
+        print(f"    Min Total Business Cost:  ${xgb_opt['min_cost']:,.2f}")
+        print(f"      - FP Friction Cost:     ${xgb_opt['best_stats']['fp_cost']:,.2f} ({xgb_opt['best_stats']['fp_count']} false alerts @ ${cost_fp:.2f})")
+        print(f"      - FN Fraud Loss:        ${xgb_opt['best_stats']['fn_cost']:,.2f} ({xgb_opt['best_stats']['fn_count']} missed frauds)")
+        print(f"      - Recovered Fraud Loss: ${xgb_opt['best_stats']['prevented_loss']:,.2f} ({xgb_opt['best_stats']['tp_count']} caught frauds)")
+        print(f"    Cost at Default (0.50):   ${xgb_opt['default_threshold_cost']:,.2f}")
+        print(f"    Financial Savings vs 0.5: ${xgb_opt['savings_vs_default']:,.2f}")
     else:
         print(f"\n[Warning] XGBoost model artifact not found in {models_dir}")
 
-    # --- 2. Unsupervised Isolation Forest Evaluation ---
+    # --------------------------------------------------------------------------
+    # 2. Unsupervised Isolation Forest Evaluation
+    # --------------------------------------------------------------------------
     iso_path = models_dir / "isolation_forest.joblib"
     if iso_path.exists():
         print("\n" + "=" * 80)
-        print("MODEL 2: Unsupervised Isolation Forest Evaluation")
+        print("MODEL 2: Unsupervised Isolation Forest")
         print("=" * 80)
 
         iso_model = joblib.load(iso_path)
-        # Raw decision function: negative for outliers, positive for inliers
-        # Inverse yields higher score for fraud
+        # decision_function gives negative values for anomalies; inverting gives higher score for fraud
         raw_anomaly = -iso_model.decision_function(X_val)
 
-        # Min-max scale to [0, 1] for threshold sweep
+        # Min-max scale anomaly score to [0, 1] so [0.01, 0.99] threshold sweep applies directly
         score_min = raw_anomaly.min()
         score_max = raw_anomaly.max()
         iso_scores = (raw_anomaly - score_min) / (score_max - score_min + 1e-12)
@@ -326,14 +340,15 @@ def run_evaluation(
         iso_pr_auc = average_precision_score(y_val, iso_scores)
         iso_roc_auc = roc_auc_score(y_val, iso_scores)
 
-        print(f"  Precision-Recall AUC (PR-AUC): {iso_pr_auc:.4f}")
-        print(f"  ROC-AUC:                       {iso_roc_auc:.4f}")
+        print(f"  PR-AUC Score (Prioritized Metric): {iso_pr_auc:.4f}")
+        print(f"  ROC-AUC Score (Reference Metric):   {iso_roc_auc:.4f}")
 
         iso_opt = find_optimal_threshold(
             y_true=y_val,
             y_scores=iso_scores,
             amounts=amounts_val,
             model_name="Unsupervised Isolation Forest",
+            threshold_range=threshold_range,
             cost_fp=cost_fp,
         )
 
@@ -342,54 +357,62 @@ def run_evaluation(
             "roc_auc": float(iso_roc_auc),
             "optimization": iso_opt,
         }
+
+        print(f"\n  [Threshold Optimization Results]:")
+        print(f"    Chosen Optimal Threshold: {iso_opt['optimal_threshold']:.2f}")
+        print(f"    Min Total Business Cost:  ${iso_opt['min_cost']:,.2f}")
+        print(f"      - FP Friction Cost:     ${iso_opt['best_stats']['fp_cost']:,.2f} ({iso_opt['best_stats']['fp_count']} false alerts @ ${cost_fp:.2f})")
+        print(f"      - FN Fraud Loss:        ${iso_opt['best_stats']['fn_cost']:,.2f} ({iso_opt['best_stats']['fn_count']} missed frauds)")
+        print(f"      - Recovered Fraud Loss: ${iso_opt['best_stats']['prevented_loss']:,.2f} ({iso_opt['best_stats']['tp_count']} caught frauds)")
+        print(f"    Cost at Default (0.50):   ${iso_opt['default_threshold_cost']:,.2f}")
+        print(f"    Financial Savings vs 0.5: ${iso_opt['savings_vs_default']:,.2f}")
     else:
         print(f"\n[Warning] Isolation Forest model artifact not found in {models_dir}")
 
-    # --- 3. Summary & Financial Cost-Benefit Comparison ---
+    # --------------------------------------------------------------------------
+    # 3. Comparative Summary Table
+    # --------------------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("FINANCIAL COST-BENEFIT SUMMARY & OPTIMAL THRESHOLDS")
+    print("EXECUTIVE SUMMARY: PR-AUC SCORES & OPTIMAL THRESHOLDS")
     print("=" * 80)
-    print(f"Baseline Unmitigated Fraud Loss (No Model): ${total_fraud_volume:,.2f}\n")
+    summary_headers = f"{'Model':<30} | {'PR-AUC':<8} | {'ROC-AUC':<8} | {'Threshold':<10} | {'Total Cost ($)':<14}"
+    print(summary_headers)
+    print("-" * len(summary_headers))
 
     for m_key, m_data in results.items():
         opt = m_data["optimization"]
-        stats = opt["best_stats"]
-        def_stats = opt["default_stats"]
+        print(
+            f"{opt['model_name']:<30} | "
+            f"{m_data['pr_auc']:<8.4f} | "
+            f"{m_data['roc_auc']:<8.4f} | "
+            f"{opt['optimal_threshold']:<10.2f} | "
+            f"${opt['min_cost']:<13,.2f}"
+        )
 
-        print(f"Model: {opt['model_name']}")
-        print(f"  PR-AUC:                   {m_data['pr_auc']:.4f}")
-        print(f"  Optimal Threshold Cutoff: {opt['optimal_threshold']:.4f}")
-        print(f"  Total Business Cost:      ${opt['min_cost']:,.2f}")
-        print(f"    - FP Friction Cost:     ${stats['fp_cost']:,.2f} ({stats['fp_count']:,} false alarms @ ${cost_fp:.2f})")
-        print(f"    - FN Fraud Loss:        ${stats['fn_cost']:,.2f} ({stats['fn_count']:,} missed frauds)")
-        print(f"    - Intercepted Fraud:    ${stats['prevented_loss']:,.2f} ({stats['tp_count']:,} stopped frauds)")
-        print(f"  Default Cutoff (0.5) Cost: ${opt['default_threshold_cost']:,.2f}")
-        print(f"  Savings vs Default 0.5:   ${opt['savings_vs_default']:,.2f}")
-        print(f"  Net Savings vs Baseline:  ${opt['savings_vs_baseline']:,.2f}")
-        print("-" * 80)
+    print("=" * 80)
 
-    # Save summary artifact
+    # Save evaluation summary to models/evaluation_results.json
     output_summary_path = models_dir / "evaluation_results.json"
-    serializable_results = {
-        k: {
-            "pr_auc": v["pr_auc"],
-            "roc_auc": v["roc_auc"],
-            "optimal_threshold": v["optimization"]["optimal_threshold"],
-            "min_total_cost": v["optimization"]["min_cost"],
-            "fp_friction_cost": v["optimization"]["best_stats"]["fp_cost"],
-            "fn_fraud_loss": v["optimization"]["best_stats"]["fn_cost"],
-            "prevented_loss": v["optimization"]["best_stats"]["prevented_loss"],
-            "savings_vs_baseline": v["optimization"]["savings_vs_baseline"],
-            "savings_vs_default": v["optimization"]["savings_vs_default"],
+    serializable = {
+        m_key: {
+            "model_name": m_data["optimization"]["model_name"],
+            "pr_auc": round(m_data["pr_auc"], 4),
+            "roc_auc": round(m_data["roc_auc"], 4),
+            "optimal_threshold": m_data["optimization"]["optimal_threshold"],
+            "min_total_cost": round(m_data["optimization"]["min_cost"], 2),
+            "fp_cost": round(m_data["optimization"]["best_stats"]["fp_cost"], 2),
+            "fn_cost": round(m_data["optimization"]["best_stats"]["fn_cost"], 2),
+            "prevented_loss": round(m_data["optimization"]["best_stats"]["prevented_loss"], 2),
+            "savings_vs_baseline": round(m_data["optimization"]["savings_vs_baseline"], 2),
+            "savings_vs_default": round(m_data["optimization"]["savings_vs_default"], 2),
         }
-        for k, v in results.items()
+        for m_key, m_data in results.items()
     }
 
     with open(output_summary_path, "w") as f:
-        json.dump(serializable_results, f, indent=2)
+        json.dump(serializable, f, indent=2)
 
-    print(f"\nSaved evaluation summary report to: {output_summary_path}")
-    print("=" * 80)
+    print(f"Saved evaluation metrics to: {output_summary_path}\n")
 
     return results
 
@@ -399,35 +422,28 @@ def main():
         description="Evaluate Fraud Models with PR-AUC and Business Cost Function Optimization"
     )
     parser.add_argument(
-        "--data-path",
-        type=str,
-        default=None,
-        help="Path to creditcard.csv dataset",
-    )
-    parser.add_argument(
-        "--preprocessed-path",
-        type=str,
-        default=None,
-        help="Path to preprocessed_data.npz",
-    )
-    parser.add_argument(
         "--models-dir",
         type=str,
         default="models",
         help="Directory containing trained model artifacts (default: models)",
     )
     parser.add_argument(
+        "--val-path",
+        type=str,
+        default=None,
+        help="Path to validation CSV (defaults to data/val_preprocessed.csv)",
+    )
+    parser.add_argument(
         "--cost-fp",
         type=float,
         default=10.0,
-        help="Cost ($) incurred per false positive friction event (default: $10.00)",
+        help="Customer friction cost ($) per false positive alarm (default: $10.00)",
     )
     args = parser.parse_args()
 
     run_evaluation(
-        data_path=Path(args.data_path) if args.data_path else None,
-        preprocessed_path=Path(args.preprocessed_path) if args.preprocessed_path else None,
         models_dir=Path(args.models_dir),
+        val_path=Path(args.val_path) if args.val_path else None,
         cost_fp=args.cost_fp,
     )
 
